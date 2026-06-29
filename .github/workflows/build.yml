@@ -26,16 +26,38 @@ jobs:
         run: |
           # devkitpro images expose pacman as either `dkp-pacman` or `pacman`
           PM=dkp-pacman; command -v $PM >/dev/null || PM=pacman
-          # refresh keyring + sync; retry on the alternate mirror host if the
-          # default one is rate-limited/blocked (pkg vs downloads host).
-          $PM -Sy --noconfirm || {
-            for f in /opt/devkitpro/pacman/etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist; do
-              [ -f "$f" ] && sed -i 's#pkg.devkitpro.org#downloads.devkitpro.org#g' "$f"
-            done
-            $PM -Sy --noconfirm
-          }
-          $PM -S --noconfirm --needed \
-            3ds-zlib 3ds-curl 3ds-mbedtls 3ds-jansson 3ds-libzstd
+          PKGS="3ds-zlib 3ds-curl 3ds-mbedtls 3ds-jansson 3ds-libzstd"
+
+          # devkitpro's pkg/downloads hosts intermittently return HTTP 403 for
+          # some shared CI IPs (see devkitPro/pacman#63). It's transient, so we
+          # rotate the mirror host and retry with backoff until the db syncs.
+          ML=/opt/devkitpro/pacman/etc/pacman.d/mirrorlist
+          [ -f "$ML" ] || ML=/etc/pacman.d/mirrorlist
+          echo "mirrorlist: $ML"; cat "$ML" || true
+
+          sync_ok=0
+          for attempt in 1 2 3 4 5 6; do
+            # alternate the host each attempt: pkg <-> downloads
+            if [ $((attempt % 2)) -eq 0 ]; then
+              sed -i 's#pkg.devkitpro.org#downloads.devkitpro.org#g' "$ML" || true
+            else
+              sed -i 's#downloads.devkitpro.org#pkg.devkitpro.org#g' "$ML" || true
+            fi
+            echo "::group::sync attempt $attempt"
+            if $PM -Sy --noconfirm; then sync_ok=1; echo "::endgroup::"; break; fi
+            echo "::endgroup::"
+            sleep $((attempt * 15))
+          done
+          if [ "$sync_ok" != 1 ]; then
+            echo "::error::devkitpro pacman db sync failed (HTTP 403 / mirror down). transient — re-run the job."
+            exit 1
+          fi
+
+          # install with a couple of retries too (cdn hiccups)
+          for attempt in 1 2 3; do
+            $PM -S --noconfirm --needed $PKGS && break
+            sleep $((attempt * 15))
+          done
 
       - name: configure
         run: |
