@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-3ds:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: environment
+        run: |
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "DEVKITARM=$DEVKITARM"
+          which cmake || echo "no cmake on PATH"
+          cmake --version || true
+
+      - name: install 3ds portlibs
+        run: |
+          # devkitpro images expose pacman as either `dkp-pacman` or `pacman`
+          PM=dkp-pacman; command -v $PM >/dev/null || PM=pacman
+          # refresh keyring + sync; retry on the alternate mirror host if the
+          # default one is rate-limited/blocked (pkg vs downloads host).
+          $PM -Sy --noconfirm || {
+            for f in /opt/devkitpro/pacman/etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist; do
+              [ -f "$f" ] && sed -i 's#pkg.devkitpro.org#downloads.devkitpro.org#g' "$f"
+            done
+            $PM -Sy --noconfirm
+          }
+          $PM -S --noconfirm --needed \
+            3ds-zlib 3ds-curl 3ds-mbedtls 3ds-jansson 3ds-libzstd
+
+      - name: configure
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: build
+        run: cmake --build build -j$(nproc)
+
+      - name: upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: porthaul-3dsx
+          path: build/porthaul.3dsx
+
+  release:
+    needs: build-3ds
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: porthaul-3dsx
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: porthaul.3dsx
